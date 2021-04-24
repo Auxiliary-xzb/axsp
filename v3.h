@@ -16,7 +16,7 @@
 #define MAXFD	128
 #define MAXLINE 1024
 
-typedef struct treeNode {
+typedef struct tree_node_t {
     //在这里保存链接套接字是因为struct epoll_event
     //本身所能携带的数据（即data域）是一个结构体    
     int fd;
@@ -35,21 +35,13 @@ typedef struct treeNode {
     //必须要知道读取了什么。
     char buf[MAXLINE];
     int readedLen;
-}node;
+}tree_node_t;
 
-typedef struct taskArgument {
+typedef struct pthread_task_t {
     int epolldf;
-    void *realArg;
-}taskArgument;
-
-//这里传递进来的参数是realArg和epollfd
-//的结构体，所以在执行任务之前，线程需
-//要对该结构体进行解包，才能把真是的参
-//数传递给回调函数。
-typedef struct pthread_task {
-    void (*task)(int epollfd, void *realArg);
+    void (*task)(int epollfd, void *arg);
     void *arg;
-}pthread_task;
+}pthread_task_t;
 
 typedef struct pthread_pool {
     //线程池允许的最小线程数
@@ -85,7 +77,7 @@ typedef struct pthread_pool {
     //任务请求队列（循环队列），用户只需要负责将请求
     //来，由线程池保存。之后的调用工作则
     //于用户无关
-    pthread_task *task_list;
+    pthread_task_t *task_list;
     //任务队列的最大值
     int max_que_size; 
     //任务对了当前含有的任务量
@@ -106,13 +98,13 @@ typedef struct pthread_pool {
     int step;
 }pthread_pool;
 
-void Listen(int epollfd, int port);
+void getListener(int epollfd, int port);
 void acceptConnection(int epollfd, void *arg);
 void readMessage(int epollfd, void *arg);
 void writeMessage(int epollfd, void *arg);
 
-pthread_pool *threadPoolCreate(int thrmin, int thrmax, int quemax);
-void *pthreadWaitTask(void *thrpool);
-void *adjustPthread(void *thrpool);
-void pthreadAddTask(pthread_pool *pool, pthread_task *task);
+void *adjustThreadPool(void *thrpool);
+pthread_pool *createThreadPool(int thrmin, int thrmax, int quemax);
+void *waitThreadTask(void *thrpool);
+void addThreadTask(pthread_pool *pool, pthread_task_t *task);
 

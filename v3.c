@@ -1,18 +1,21 @@
 #include "v3.h"
 #include <pthread.h>
+#include <errno.h>
 #include <sys/epoll.h>
 
-static pthread_mutex_t acceptLock = PTHREAD_MUTEX_INITIALIZER;
-static node event_g[MAXFD+1];
+static pthread_mutex_t _acceptLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t _listenFDlock = PTHREAD_MUTEX_INITIALIZER;
+static tree_node_t hadListenedFD[MAXFD+1];
+static int counter;
 
 //用于设置挂载到红黑树上的节点，最后一个参数为传递给
 //回调函数的参数，
-static void setNode(node *realNode, int fd, void(*callBack)(int fd, void *arg), void *arg);
-static void addNode(int epollfd, int events, node *realNode);
-static void delNode(int epollfd, node *realNode);
-static void newNode(node *newNode, char cliname[], int len, int port);
+static void setNode(tree_node_t *oldNode, int fd, void(*callBack)(int epollfd, void *newNode), void *newNode);
+static void addNode(int epollfd, int events, tree_node_t *newNode);
+static void modNode(int epollfd, int events, tree_node_t *newNode);
+static void newNode(tree_node_t *newNode, char cliname[], int len, int port);
 
-void Listen(int epollfd, int port){
+void getListener(int epollfd, int port){
     int lisfd;
     struct sockaddr_in servaddr;
 
@@ -26,57 +29,62 @@ void Listen(int epollfd, int port){
     servaddr.sin_port = htons(port);
     servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
 
+    int flags = fcntl(lisfd, F_GETFD); 
+    flags |= O_NONBLOCK;
+    fcntl(lisfd, F_SETFD, flags);
+    
     (void)bind(lisfd, (struct sockaddr *)&servaddr, sizeof(servaddr));
     listen(lisfd, 5);
 
-    setNode(&event_g[0], lisfd, acceptConnection, &event_g[0]);    
-    addNode(epollfd, EPOLLIN, &event_g[0]);
+    setNode(&hadListenedFD[0], lisfd, acceptConnection, &hadListenedFD[0]);    
+    addNode(epollfd, EPOLLIN, &hadListenedFD[0]);
 }
 
 void acceptConnection(int epollfd, void *arg) {
-    node *listnNode = (node *)arg;
+    tree_node_t *listnNode = (tree_node_t *)arg;
 
     int lisfd = listnNode->fd;
 
-    int connfd;
+    int connfd = -1;
     struct sockaddr_in cliaddr;
     socklen_t clilen = sizeof(cliaddr);
 
     bzero(&cliaddr, sizeof(cliaddr));
-    pthread_mutex_lock(&acceptLock);
+    pthread_mutex_lock(&_acceptLock);
     if ((connfd = accept(lisfd, (struct sockaddr *)&cliaddr, &clilen)) == -1) {
-	perror("Accept error:");
+	printf("errno %d error is %s\n", errno, strerror(errno));
 	printf("%d\n", lisfd);
 	abort();
     }
-    pthread_mutex_unlock(&acceptLock);
+    counter++;
+    pthread_mutex_unlock(&_acceptLock);
    
-    //int flags = fcntl(connfd, F_GETFD); 
-    //flags |= O_NONBLOCK;
-    //fcntl(connfd, F_SETFD, flags);
+    int flags = fcntl(connfd, F_GETFD); 
+    flags |= O_NONBLOCK;
+    fcntl(connfd, F_SETFD, flags);
 
+    pthread_mutex_lock(&_listenFDlock);
     char name[128];
     inet_ntop(AF_INET, &cliaddr.sin_addr, name, sizeof(name));
     int cliport = ntohs(cliaddr.sin_port);
-    printf("connection from %s:%d\n", name, cliport);
-
+    printf("[%d]:connection from %s:%d\n", counter, name, cliport);
+    
     int i;
     for (i = 1; i < MAXFD; i++) {
-	if (event_g[i].inTree == 0)
+	if (hadListenedFD[i].inTree == 0)
 	    break;
     }
-
-    newNode(&event_g[i], name, sizeof(name), cliport);
-    setNode(&event_g[i], connfd, readMessage, &event_g[i]); 
-    addNode(epollfd, EPOLLIN, &event_g[i]);
-    printf("listen read............................\n");
+    
+    newNode(&hadListenedFD[i], name, sizeof(name), cliport);
+    setNode(&hadListenedFD[i], connfd, readMessage, &hadListenedFD[i]); 
+    addNode(epollfd, EPOLLIN, &hadListenedFD[i]);
+    pthread_mutex_unlock(&_listenFDlock);
 }
 
 void readMessage(int epollfd, void *arg) {
-    node *connNode = (node *)arg; 
-    int connfd = connNode->fd;
+    tree_node_t *connNode = (tree_node_t *)arg;
 
-    delNode(epollfd, connNode);
+    int connfd = connNode->fd;
     /*
      * 这里如果使用局部buffer的话那么
      * 在套接字可写时就无法访问到了
@@ -89,12 +97,15 @@ void readMessage(int epollfd, void *arg) {
 
     if (n > 0) {
 	connNode->readedLen = n;
-#if 1
-	printf("server has readed %d bytes from %s:%d.\n", connNode->readedLen, connNode->cliname, connNode->cliport);
-#endif
-
+    
+	for (int i = 0; i != n; i++) {
+	    printf("%c", connNode->buf[i]);
+	}
+	printf("\n");
+    pthread_mutex_lock(&_listenFDlock);
 	setNode(connNode, connfd, writeMessage, connNode);
-	addNode(epollfd, EPOLLOUT, connNode);
+	modNode(epollfd, EPOLLOUT, connNode);
+	pthread_mutex_unlock(&_listenFDlock);
     } else if (n == 0) {
 	close(connfd);
     } else {
@@ -104,34 +115,23 @@ void readMessage(int epollfd, void *arg) {
 }
 
 void writeMessage(int epollfd, void *arg) {
-     node *connNode = (node *)arg;
-     int connfd = connNode->fd;
- 
- #if 0
-     printf("start writing. %d bytes will be write.\n", connNode->readedLen); 
- #endif
-     char buf[MAXLINE];
-     for (int i = 0; i != connNode->readedLen; i++) {
- #if 0
- 	printf("wrtie buf[%d]:%c", i, connNode->buf[i]);
- #endif
- 	buf[i] = toupper(connNode->buf[i]);
-     }
- #if 0
-     printf("end writing.\n");
- #endif
-     write(connfd, buf, connNode->readedLen);   
- #if 0
-     printf("%s:%d has writed %d bytes.\n", connNode->cliname, connNode->cliport, connNode->readedLen);
- #endif
- 
-     delNode(epollfd, connNode);
- 
-     setNode(connNode, connfd, readMessage, connNode);
-     addNode(epollfd, EPOLLIN, connNode);
+    tree_node_t *connNode = (tree_node_t *)arg;
+    int connfd = connNode->fd;
+    
+    char buf[MAXLINE];
+    for (int i = 0; i != connNode->readedLen; i++) {
+	buf[i] = toupper(connNode->buf[i]);
+    }
+    
+    write(connfd, buf, connNode->readedLen);   
+
+    pthread_mutex_lock(&_listenFDlock);
+    setNode(connNode, connfd, readMessage, connNode);
+    modNode(epollfd, EPOLLIN, connNode);
+    pthread_mutex_unlock(&_listenFDlock);
 }
 
-static void newNode(node *newNode, char cliname[], int len, int port) {
+static void newNode(tree_node_t *newNode, char cliname[], int len, int port) {
     newNode->arg = NULL;
     newNode->callBack = NULL;
     newNode->events = 0;
@@ -146,51 +146,46 @@ static void newNode(node *newNode, char cliname[], int len, int port) {
 /* 
  * 这相当于更新操作
  */
-static void setNode(node *realNode, int fd, void (*callBack)(int fd, void *arg), void *arg) {
-    node *oldNode = (node *)arg;
+static void setNode(tree_node_t *old, int fd, void (*callBack)(int fd, void *arg), void *newNode) {
+    tree_node_t *new = (tree_node_t *)newNode;
 
-    realNode->fd = oldNode->fd = fd;
-    realNode->events = oldNode->events;
-    realNode->inTree = oldNode->inTree;
-    realNode->callBack = callBack;
-    realNode->readedLen = oldNode->readedLen;
-    realNode->arg = arg;    
-    strncpy(realNode->buf, oldNode->buf, oldNode->readedLen);
+    new->fd = old->fd = fd;
+    new->events = old->events;
+    new->inTree = old->inTree;
+    new->callBack = callBack;
+    new->readedLen = old->readedLen;
+    new->arg = new;
+    strncpy(new->buf, old->buf, old->readedLen);
 }
 
-static void addNode(int epollfd, int events, node *realNode) {
+static void addNode(int epollfd, int events, tree_node_t *newNode) {
     struct epoll_event tmp;
 
-    if (realNode->inTree == 0)    
-	realNode->inTree = 1;
-    realNode->events = events;
+    if (newNode->inTree == 0)    
+	newNode->inTree = 1;
+    newNode->events = events;
 
-//    tmp.events = events | EPOLLET;
+    tmp.events = events | EPOLLET;
+    tmp.data.ptr = newNode;
+
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, newNode->fd, &tmp);
+}
+
+static void modNode(int epollfd, int events, tree_node_t *newNode) {
+    struct epoll_event tmp;
+
+    if (newNode->inTree == 0)    
+        newNode->inTree = 1;
+    newNode->events = events;
+
+    //tmp.events = events | EPOLLET;
     tmp.events = events;
-    tmp.data.ptr = realNode;
+    tmp.data.ptr = newNode;
 
-    epoll_ctl(epollfd, EPOLL_CTL_ADD, realNode->fd, &tmp);
-#if 1
-    printf("Add node %d for %s.\n", realNode->fd, (events & EPOLLIN) ? "EPOLLIN" : "EPOLLOUT");
-#endif
+    epoll_ctl(epollfd, EPOLL_CTL_MOD, newNode->fd, &tmp);
 }
 
-static void delNode(int epollfd, node *realNode) {
-    struct epoll_event tmp = {0,{0}}; 
-    realNode->inTree = 0;
-    realNode->events = 0;
-
-    //为什么这里一定要删除是因为添加操作一定是
-    //在描述符没有挂载在红黑树上时才行，所以如
-    //果该描述符仍然在红黑树上，那么它没有被更
-    //改，并且一直在监听读时间。
-    epoll_ctl(epollfd, EPOLL_CTL_DEL, realNode->fd, &tmp);
-#if 0
-    printf("del %d node success.\n", realNode->fd);
-#endif
-}
-
-pthread_pool *pthreadPoolCreate(int thrmin, int thrmax, int quemax){
+pthread_pool *createThreadPool(int thrmin, int thrmax, int quemax){
     pthread_pool *pool = (pthread_pool *)malloc(sizeof(pthread_pool));
 
     pool->bsy_thr_num = 0;
@@ -213,25 +208,21 @@ pthread_pool *pthreadPoolCreate(int thrmin, int thrmax, int quemax){
 
 
     pool->pthreads = (pthread_t *)malloc(sizeof(pthread_t)*thrmax);
-    pool->task_list = (pthread_task *)malloc(sizeof(pthread_task)*quemax);
-    bzero(pool->task_list, sizeof(pthread_task)*quemax);
+    pool->task_list = (pthread_task_t *)malloc(sizeof(pthread_task_t)*quemax);
+    bzero(pool->task_list, sizeof(pthread_task_t)*quemax);
 
-    pthread_create(&pool->adjust_thread, NULL, adjustPthread, (void *)pool);
+    //pthread_create(&pool->adjust_thread, NULL, adjustThreadPool, (void *)pool);
 
     int i;
     for (i = 0; i < thrmin; i++) {
-	pthread_create(&pool->pthreads[i], NULL, pthreadWaitTask, (void *)pool);
+	pthread_create(&pool->pthreads[i], NULL, waitThreadTask, (void *)pool);
     }
 
     return pool;
 }
 
-void *adjustPthread(void *thrpool) {
+void *adjustThreadPool(void *thrpool) {
     pthread_pool * pool = (pthread_pool *)thrpool;
-
-#if 2
-    printf("Manager start.\n");
-#endif
 
     //当管理者线程开启时就一定是忙碌的线程
     pthread_mutex_lock(&pool->mutex_bsy_alv);
@@ -255,27 +246,18 @@ void *adjustPthread(void *thrpool) {
 	    //增大
 	    pool->pthreads = (pthread_t *)realloc(pool->pthreads, pool->alv_thr_num + pool->step);
 	    pool->max_thr_num += pool->step;
-#if 2
-	    printf("Manager increase the threads pool.\n");	
-#endif
 	} else if (((float)pool->bsy_thr_num / (float)pool->alv_thr_num) < 0.15)  {
 	    //这里只减少一部分线程
 	    int index = pool->max_thr_num - pool->step;
 	    for (int i = pool->alv_thr_num - 1;
 		    i > index; i--) 
 		free(&pool->pthreads[i]);
-#if 0
-	    printf("Manager decrease the threads pool.\n");
-#endif
 	}
 
 	//如果当前忙碌的线程和存活的线程数相同则需要
 	//开启新的存活线程
 	for (int i = 0; i < pool->step; i++) {
-	    pthread_create(&pool->pthreads[pool->alv_thr_num + i], NULL, pthreadWaitTask, NULL);
-#if 0
-	    printf("add new live thread to pool.\n");
-#endif 
+	    pthread_create(&pool->pthreads[pool->alv_thr_num + i], NULL, waitThreadTask, NULL); 
 	}
 	pool->alv_thr_num += pool->step;
 	pthread_mutex_unlock(&pool->mutex_thr);
@@ -284,26 +266,24 @@ void *adjustPthread(void *thrpool) {
 }
 
 //生产者
-void *pthreadWaitTask(void *thrpool) {
+void *waitThreadTask(void *thrpool) {
     pthread_pool * pool = (pthread_pool *)thrpool;
-
+    pthread_task_t t;
+    
     //每一个线程完成一次工作后就返回线程池
     //中继续等待，因此放在一个死循环中
     while(1) {
 	pthread_mutex_lock(&pool->mutex_thr);
 	//任务对了中没有任务时就开始等待
 	while (pool->cur_que_size == 0) {
-#if 0
-	    printf("A thread waiting a task.\n");
-#endif
 	    pthread_cond_wait(&(pool->queue_not_empty), &(pool->mutex_thr));
 	}
 
-#if 1
-	printf("Get a job\n");
-#endif
 	//任务队列中有任务时就开始执行
-	pthread_task t = pool->task_list[pool->front_queue];
+    t.epolldf = (pool->task_list[pool->front_queue]).epolldf;
+    t.task = (pool->task_list[pool->front_queue]).task;
+    t.arg = (pool->task_list[pool->front_queue]).arg;
+    
 	pool->front_queue = (pool->front_queue + 1) % pool->max_que_size;
 	pool->cur_que_size--;
 
@@ -312,50 +292,28 @@ void *pthreadWaitTask(void *thrpool) {
 
 	//如果当前开启的线程都用完了就唤醒管理者线程
 	if ( pool->alv_thr_num == pool->bsy_thr_num ) {
-#if 1
-	    printf("Manager got siganl to work.\n");
-#endif
-	    pthread_cond_signal(&pool->do_adjust);
+        printf("hjahhaha\n");
+        //pthread_cond_signal(&pool->do_adjust);
 	}
-
+	
 	pthread_mutex_unlock(&(pool->mutex_thr));
 
 	//先将当前的busy值增加，然后执行函数，
 	//执行完后将busy减少
 	pthread_mutex_lock(&(pool->mutex_bsy_alv));
-#if 0
-	printf("thread[%d] get a work.\n", pool->bsy_thr_num - 1);
-#endif 
 	pool->bsy_thr_num++;
 	pthread_mutex_unlock(&(pool->mutex_bsy_alv));
 
-	//这里就是懒了，task的参数包含了回调函数
-	//需要的epollfd和实际参数，实际的解包工作
-	//应该交给回调函数自己去做，但是我不想再
-	//修改函数原型了，好麻烦。
-	//所以就在这里先解包了，这样不好破坏了多
-	//线程模型的结构。
-	//t.task(t.arg);  好的结构应该让回调函数自己解包
-	pthread_task *a = (pthread_task *)t.arg;
-	taskArgument *arg = (taskArgument *)a->arg;
-	node *c = (node *)arg->realArg;	
-	int epollfd = arg->epolldf;
-#if 0
-	printf("the fd argument is %d\n", c->fd);
-#endif
-	t.task(epollfd, arg->realArg);
+	(*t.task)(t.epolldf, t.arg);
 
 	pthread_mutex_lock(&(pool->mutex_bsy_alv));
-#if 1
-	printf("thread[%d] has done a work.\n", pool->bsy_thr_num - 1);
-#endif
 	pool->bsy_thr_num--;
 	pthread_mutex_unlock(&(pool->mutex_bsy_alv));
     }
     return NULL;
 }
 
-void pthreadAddTask(pthread_pool *pool, pthread_task *task) {
+void addThreadTask(pthread_pool *pool, pthread_task_t *task) {
     pthread_mutex_lock((&pool->mutex_thr));
 
     //如果队列满了就等待
@@ -366,11 +324,6 @@ void pthreadAddTask(pthread_pool *pool, pthread_task *task) {
     //将任务添加到人物队列
     bcopy(task, &(pool->task_list[pool->rear_queue]), sizeof(*task));
     pool->rear_queue = (pool->rear_queue + 1) % pool->max_que_size;
-#if 1
-    printf("file fd is %d, event is %s.\n",((node*)(((taskArgument *)task->arg)->realArg))->fd,
-	    (((node*)(((taskArgument *)task->arg)->realArg))->events & EPOLLIN) ? "EPLLIN" : "EPOLLOUT");
-    printf("A task add to queue .There has %d task.\n", pool->cur_que_size);
-#endif
     pool->cur_que_size++;
 
     //加入队列之后告诉别人你可以拿了
@@ -381,12 +334,8 @@ void pthreadAddTask(pthread_pool *pool, pthread_task *task) {
 int main(int argc, char *argv[]) {
     int epollfd, port;
     struct epoll_event revent[1024];
-
-    if (argc < 2) {
+    
 	port  = 9527;
-    } else {
-	port = atoi(argv[2]);
-    }
 
     /*
      *  犯了一个很低级的错误，本意是想让函数帮我
@@ -402,43 +351,29 @@ int main(int argc, char *argv[]) {
     //pthread_pool pool;
     //pthreadPoolCreate(&pool, 20, 100, 100);
 
-    pthread_pool *pool = pthreadPoolCreate(20, 100, 100);
+    pthread_pool *pool = createThreadPool(10, 100, 100);
 
     epollfd = epoll_create(MAXFD);
 
     //主线程用来监听
-    Listen(epollfd, port);
-
-    taskArgument arg = {0, NULL};
-    pthread_task task = {NULL, NULL};	
+    getListener(epollfd, port);
+    pthread_task_t work;
 
     for (;;) {
-	int ret = epoll_wait(epollfd, revent, MAXFD, 1000);
+        int ret = epoll_wait(epollfd, revent, MAXFD, -1);
 
-	for (int i = 0; i != ret; i++) {
-	    node *ev = (node *)revent[i].data.ptr;
+        for (int i = 0; i != ret; i++) {
+            tree_node_t *ev = (tree_node_t *)revent[i].data.ptr;
 
-	    bzero(&task, sizeof(task));
-	    bzero(&arg, sizeof(arg));
+            if ( ((revent[i].events & EPOLLIN) && (ev->events & EPOLLIN))  
+                ||  ((revent[i].events & EPOLLOUT) && (ev->events & EPOLLOUT)) ) {
 
-	    //将epoll描述服和传递给毁掉函数的
-	    //参数都封装到一个结构体中
-	    arg.epolldf = epollfd;
-	    arg.realArg = (void *)ev;
-	    task.task = ev->callBack;
-	    task.arg = (void *)&arg;
-
-	    //先只处理写和读
-	    if  ((revent[i].events & EPOLLIN) && (ev->events & EPOLLIN)) {
-#if 1
-		printf("fd is %d.......................................\n", ev->fd);
-#endif
-		pthreadAddTask(pool, &task);
-	    }
-	    if ((revent[i].events & EPOLLOUT) && (ev->events & EPOLLOUT)) {
-		pthreadAddTask(pool, &task);
-	    }
-	}
+                work.epolldf = epollfd;
+                work.task = ev->callBack;
+                work.arg = ev;
+                addThreadTask(pool, &work);
+            }
+        }
     }
     return 0;
 }
