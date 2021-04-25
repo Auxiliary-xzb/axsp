@@ -1,4 +1,5 @@
 #include "v3.h"
+#include <asm-generic/errno-base.h>
 #include <pthread.h>
 #include <errno.h>
 #include <sys/epoll.h>
@@ -22,7 +23,6 @@ void getListener(int epollfd, int port){
     struct sockaddr_in servaddr;
 
     lisfd = socket(AF_INET, SOCK_STREAM, 0);
-    printf("listen fd is %d\n", lisfd);
 
     int opt = 1;
     bzero(&servaddr, sizeof(servaddr));
@@ -78,9 +78,12 @@ void acceptConnection(int epollfd, void *arg) {
     int i;
     for (i = 1; i < MAXFD; i++) {
 	if (hadListenedFD[i].inTree == 0){
-	    printf("%d\n", i);
 	    break;
 	}
+    }
+    if (i == MAXFD) {
+	printf("Tree node can't accept anymore. :%d\n", MAXFD);
+	close(connfd);
     }
 
     newNode(&hadListenedFD[i], name, sizeof(name), cliport);
@@ -106,11 +109,11 @@ void readMessage(int epollfd, void *arg) {
     if (n > 0) {
 	connNode->readedLen = n;
 
-	for (int i = 0; i != n; i++) {
-	    printf("%c", connNode->buf[i]);
-	}
-	printf("\n");
-
+//	for (int i = 0; i != n; i++) {
+//	    printf("%c", connNode->buf[i]);
+//	}
+//	printf("\n");
+//
 	pthread_mutex_lock(&_listenFDlock);
 	setNode(connNode, connfd, writeMessage, connNode);
 	modNode(epollfd, EPOLLOUT, connNode);
@@ -221,7 +224,8 @@ pthread_pool *createThreadPool(int thrmin, int thrmax, int quemax){
     pool->step = 10;
 
     pthread_mutex_init(&pool->mutex_thr , NULL);
-    pthread_mutex_init(&pool->mutex_bsy_alv, NULL);
+    pthread_mutex_init(&pool->mutex_bsy, NULL);
+    pthread_mutex_init(&pool->mutex_alv, NULL);
     pthread_cond_init(&pool->queue_not_full, NULL);
     pthread_cond_init(&pool->queue_not_empty, NULL);
     pthread_cond_init(&pool->do_adjust, NULL);
@@ -248,9 +252,9 @@ void *adjustThreadPool(void *thrpool) {
     pthread_pool * pool = (pthread_pool *)thrpool;
 
     //当管理者线程开启时就一定是忙碌的线程
-    pthread_mutex_lock(&pool->mutex_bsy_alv);
+    pthread_mutex_lock(&pool->mutex_bsy);
     pool->bsy_thr_num++;
-    pthread_mutex_unlock(&pool->mutex_bsy_alv);
+    pthread_mutex_unlock(&pool->mutex_bsy);
 
     //管理者的生命周期和整个程序的生命周期相同，因此在死循环中
     while(1) {
@@ -266,6 +270,7 @@ void *adjustThreadPool(void *thrpool) {
 	    break;
 	}
 	
+	printf("Hhahhahaha\n");
 	//首先根据忙碌的线程判断是否需要扩容或收缩
 	if (((float)pool->bsy_thr_num / (float)pool->alv_thr_num) > 0.75) {
 	    pool->pthreads = (pthread_t *)realloc(pool->pthreads, pool->alv_thr_num + pool->step);
@@ -275,18 +280,23 @@ void *adjustThreadPool(void *thrpool) {
 	    for (int i = pool->alv_thr_num - 1; i > index; i--) 
 		free(&pool->pthreads[i]);
 	}
-
+	pthread_mutex_unlock(&pool->mutex_thr);
+ 
 	/*
 	 * 如果通知者不需要扩容或者收缩，则代表线程池中的
 	 * 绝大部分线程都处于工作中了，需要添加一些线程等
 	 * 待在线程池中。 
 	 */
-	for (int i = 0; i < pool->step; i++) {
-	    pthread_create(&(pool->pthreads[pool->alv_thr_num + i]), NULL, waitThreadTask, NULL); 
+	for (int i = 0; i < pool->step && pool->alv_thr_num < pool->max_thr_num; i++) {
+	    //pthread_mutex_lock(&pool->mutex_alv);
+	    if ( pthread_create(&(pool->pthreads[pool->alv_thr_num + i]), NULL, waitThreadTask, NULL) == 0 ) {
+		pool->alv_thr_num++;
+	    } else {
+		i--;
+	    }
 	    printf("Add thread to pool, fd is %u.\n", pool->pthreads[pool->alv_thr_num + i]);
+	   //pthread_mutex_unlock(&pool->mutex_alv);
 	}
-	pool->alv_thr_num += pool->step;
-	pthread_mutex_unlock(&pool->mutex_thr);
     }
     return NULL;
 }
@@ -307,7 +317,24 @@ void *waitThreadTask(void *thrpool) {
      * 取任务处理任务的过程放在一个死循环中。
      */
     while(1) {
-	pthread_mutex_lock(&pool->mutex_thr);
+	/*
+	 * 这里存在一个问题：在默认开始时创建的
+	 * 等待线程在获取锁时都不会出现什么问题，
+	 * 因为每一个线程获取锁后立即放弃锁开始
+	 * 等待，那么就不会出现有线程拿着锁，而
+	 * 新创建的线程在调用此函数时却拿不到锁
+	 * 从而失败。
+	 * 但是对于已经有线程在工作而此时管理线
+	 * 程需要添加额外的等待线程时，那么就可
+	 * 能出现，创建的新线程会拿不到锁的情况，
+	 * 此时新的线程直接创建失败。
+	 */
+	if ( pthread_mutex_trylock(&pool->mutex_thr) != 0) {
+	    int erno_save = errno;
+	    if ( erno_save == EBUSY )
+		printf("can't get lock");
+	    return NULL;
+	}
 	//当任务队列中没有任务时则等待队列不为空
 	while (pool->cur_que_size == 0) {
 	    pthread_cond_wait(&(pool->queue_not_empty), &(pool->mutex_thr));
@@ -320,27 +347,29 @@ void *waitThreadTask(void *thrpool) {
 	pool->front_queue = (pool->front_queue + 1) % pool->max_que_size;
 	pool->cur_que_size--;
 
-	//拿了东西就告知对方，你可以放了
-	pthread_cond_signal((&pool->queue_not_full));
-
 	//如果当前开启的线程都用完了就唤醒管理者线程
+	//pthread_mutex_lock(&pool->mutex_alv);
 	if ( pool->alv_thr_num == pool->bsy_thr_num ) {
 	    printf("Wakeup manager.\n");
 	    pthread_cond_signal(&pool->do_adjust);
 	}
+	//pthread_mutex_lock(&pool->mutex_alv);
+	
+	//拿了东西就告知对方，你可以放了
+	pthread_cond_signal(&pool->queue_not_full);
 
-	pthread_mutex_unlock(&(pool->mutex_thr));
+	pthread_mutex_unlock(&pool->mutex_thr);
 
 	//在执行任务前后都需要更新忙碌线程数量
-	pthread_mutex_lock(&(pool->mutex_bsy_alv));
+	pthread_mutex_lock(&pool->mutex_bsy);
 	pool->bsy_thr_num++;
-	pthread_mutex_unlock(&(pool->mutex_bsy_alv));
+	pthread_mutex_unlock(&pool->mutex_bsy);
 
 	(*t.task)(t.epolldf, t.arg);
 
-	pthread_mutex_lock(&(pool->mutex_bsy_alv));
+	pthread_mutex_lock(&pool->mutex_bsy);
 	pool->bsy_thr_num--;
-	pthread_mutex_unlock(&(pool->mutex_bsy_alv));
+	pthread_mutex_unlock(&pool->mutex_bsy);
     }
     return NULL;
 }
@@ -354,7 +383,7 @@ void addThreadTask(pthread_pool *pool, pthread_task_t *task) {
 
     //如果队列满了就等待
     while (pool->cur_que_size == pool->max_que_size) {
-	pthread_cond_wait(&(pool->queue_not_full), &(pool->mutex_thr));
+	pthread_cond_wait(&pool->queue_not_full, &pool->mutex_thr);
     }
 
     //将任务添加到任务队列
@@ -363,8 +392,8 @@ void addThreadTask(pthread_pool *pool, pthread_task_t *task) {
     pool->cur_que_size++;
 
     //加入队列之后通知消费者可以从队列中拿去任务了
-    pthread_cond_broadcast(&(pool->queue_not_empty));
-    pthread_mutex_unlock(&(pool->mutex_thr));
+    pthread_cond_broadcast(&pool->queue_not_empty);
+    pthread_mutex_unlock(&pool->mutex_thr);
 }
 
 int main(int argc, char *argv[]) {
@@ -372,7 +401,7 @@ int main(int argc, char *argv[]) {
     struct epoll_event revent[1024];
 
     port  = 9527;
-    pthread_pool *pool = createThreadPool(10, 100, 100);
+    pthread_pool *pool = createThreadPool(100, 1000, 500);
 
     epollfd = epoll_create(MAXFD);
 
